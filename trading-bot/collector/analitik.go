@@ -57,7 +57,7 @@ func supportsWebSocket(symbol string) bool {
     }
     defer conn.Close()
 
-    // Пробуем подписаться на канал publicTrade.<symbol>
+    // Отправляем запрос на подписку
     sub := map[string]interface{}{
         "op":   "subscribe",
         "args": []string{fmt.Sprintf("publicTrade.%s", symbol)},
@@ -65,7 +65,23 @@ func supportsWebSocket(symbol string) bool {
     if err := conn.WriteJSON(sub); err != nil {
         return false
     }
-    return true
+
+    // Ждём подтверждения от Bybit
+    conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+    _, msg, err := conn.ReadMessage()
+    if err != nil {
+        return false
+    }
+
+    // По документации Bybit вернёт JSON вида {"success":true,...} или объект с error
+    var resp struct {
+        Success bool `json:"success"`
+        RetMsg  string `json:"ret_msg"`
+    }
+    if err := json.Unmarshal(msg, &resp); err != nil {
+        return false
+    }
+    return resp.Success
 }
 
 type Config struct {
