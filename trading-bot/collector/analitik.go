@@ -133,7 +133,10 @@ func main() {
 		wsConn      *websocket.Conn
 		currentPair string
 	)
-
+	go func() {
+		time.Sleep(100 * time.Millisecond) // чуть-чуть подождать, чтобы логгеры инициализировались
+		volTicker.C <- time.Now()
+	}()
 	volTicker := time.NewTicker(volatilityInt)
 	saveTicker := time.NewTicker(saveInterval)
 	defer volTicker.Stop()
