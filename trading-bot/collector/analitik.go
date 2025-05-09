@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,41 +29,43 @@ import (
 	"gonum.org/v1/gonum/stat"
 )
 
-// ===================== Константы =====================
+// ===================== Настройки =====================
 const (
 	bybitREST        = "https://api.bybit.com"
 	wsEndpoint       = "wss://stream.bybit.com/v5/public/spot"
-	tickStoreSize    = 500      // количество тиков в буфере
-	minLiquidityUSD  = 10000    // порог оборота/ликвидности
-	volatilityWeight = 0.6      // вес волатильности в score
-	volumeWeight     = 0.4      // вес объема в score
-	volatilityInt    = 10 * time.Minute   // как часто пересчитывать пару
-	saveInterval     = 5 * time.Second    // как часто сохранять буфер тиков
+	tickStoreSize    = 500               // размер буфера тиков
+	minLiquidityUSD  = 10000.0           // минимум оборота для пары
+	volatilityWeight = 0.6               // вес волатильности в score
+	volumeWeight     = 0.4               // вес объёма в score
+	volatilityInt    = 10 * time.Minute  // как часто пересчитываем пару
+	saveInterval     = 5 * time.Second   // как часто публикуем/сохраняем тики
 	apiUserAgent     = "AnalitikBot/1.0"
 	wsDialTimeout    = 5 * time.Second
 	wsReadTimeout    = 10 * time.Second
+	apiRecvWindow    = "5000"
 
-	natsURL     = "nats://localhost:4222"
-	natsSubject = "trading.data"
-
+	natsURL      = "nats://localhost:4222"
+	natsSubject  = "trading.data"
 	dataFilePath = "trading_data.json"
 )
 
-// ===================== Типы =====================
+// ===================== Конфигурация =====================
+var cfg Config
 
-// Config может быть расширен чтением из YAML/ENV
 type Config struct {
+	APIKey       string
+	APISecret    string
 	FallbackPair string
+	TestMode     bool
 }
 
-// MarketData хранит метрики для каждой пары
+// ===================== Типы =====================
 type MarketData struct {
 	Turnover float64
 	Volume   float64
 	Last     float64
 }
 
-// Tick представляет одну сделку
 type Tick struct {
 	Ts    int64   `json:"ts"`
 	Price float64 `json:"price"`
@@ -68,7 +73,6 @@ type Tick struct {
 	Side  string  `json:"side"`
 }
 
-// TradingData — упаковка для публикации в NATS
 type TradingData struct {
 	Symbol    string  `json:"symbol"`
 	Price     float64 `json:"price"`
@@ -78,29 +82,39 @@ type TradingData struct {
 }
 
 // ===================== Глобальные переменные =====================
-
 var (
 	lg        *logrus.Logger
 	logFile   *os.File
 	natsConn  *nats.Conn
 	rateLimit = make(chan struct{}, 40)
 
-	// буфер тиков + синхронизация
 	tickBuf = make([]Tick, 0, tickStoreSize)
 	bufMu   sync.Mutex
+
+	// для публикации
+	lastPrice float64
+	lastVol   float64
 )
 
-// ===================== Основная логика =====================
-
+// ===================== main =====================
 func main() {
 	printBanner()
+
+	// читаем конфиг
+	cfg = Config{
+		APIKey:       "AmbrZFvlnJQnrG84mu",
+		APISecret:    "24WTcfb3ODnBFXT0LGubleqA3dKCNtkZFIOC",
+		FallbackPair: "PEPEUSDT",
+		TestMode:     false,
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	initLogging()
 	defer logFile.Close()
 
-	// подключаем NATS
+	// NATS
 	var err error
 	natsConn, err = nats.Connect(natsURL,
 		nats.MaxReconnects(5), nats.ReconnectWait(2*time.Second), nats.Timeout(5*time.Second))
@@ -110,20 +124,10 @@ func main() {
 	defer natsConn.Close()
 	lg.Info("Успешное соединение с NATS")
 
-	// наполняем rateLimit
+	// rate limit
 	for i := 0; i < cap(rateLimit); i++ {
 		rateLimit <- struct{}{}
 	}
-
-
-	cfg := Config{
-		APIKey:       "AmbrZFvlnJQnrG84mu",
-		APISecret:    "24WTcfb3ODnBFXT0LGubleqA3dKCNtkZFIOC",
-		FallbackPair: "PEPEUSDT",
-		TestMode:     false,
-	}
-
-	// Redis или иные сервисы можно инициализировать здесь, если нужно
 
 	var (
 		wsConn      *websocket.Conn
@@ -135,19 +139,20 @@ func main() {
 	defer volTicker.Stop()
 	defer saveTicker.Stop()
 
-	lg.Infof("=== Запуск цикла каждые %s, сохранение каждые %s ===", volatilityInt, saveInterval)
+	lg.Infof("=== Цикл выбора пары каждые %s, публикация тиков каждые %s ===",
+		volatilityInt, saveInterval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			lg.Info("Выход по сигналу")
+			lg.Info("Завершаем работу")
 			if wsConn != nil {
 				wsConn.Close()
 			}
 			return
 
 		case <-volTicker.C:
-			// 1) Фильтруем пары и выбираем лучшую
+			// выбираем пару
 			markets, err := getFilteredUSDTMarkets()
 			if err != nil {
 				lg.Errorf("Ошибка фильтрации пар: %v", err)
@@ -155,9 +160,11 @@ func main() {
 			}
 			pair, vol := selectMostVolatilePair(markets, cfg.FallbackPair)
 			price := markets[pair].Last
+			lastPrice = price
+			lastVol = vol
 			printPairInfo(pair, price, vol)
 
-			// 2) Переключаем WS-стрим при смене пары
+			// переключаем WS-стрим при смене пары
 			if pair != currentPair {
 				if wsConn != nil {
 					wsConn.Close()
@@ -165,6 +172,7 @@ func main() {
 				bufMu.Lock()
 				tickBuf = tickBuf[:0]
 				bufMu.Unlock()
+
 				wsConn, err = startTradeStream(pair)
 				if err != nil {
 					lg.Warnf("Ошибка WS для %s: %v", pair, err)
@@ -173,30 +181,30 @@ func main() {
 			}
 
 		case <-saveTicker.C:
-			// 3) Каждые несколько секунд публикуем данные
+			// публикуем и сохраняем тики
 			bufMu.Lock()
 			ticks := make([]Tick, len(tickBuf))
 			copy(ticks, tickBuf)
 			bufMu.Unlock()
+
 			if len(ticks) == 0 {
 				continue
 			}
+
 			data := TradingData{
 				Symbol:    currentPair,
-				Price:     marketsLastPrice(currentPair),
-				VolPct:    marketsLastVol(currentPair),
+				Price:     lastPrice,
+				VolPct:    lastVol,
 				Timestamp: time.Now().Unix(),
 				Ticks:     ticks,
 			}
-			// publish
+
 			if err := natsConn.Publish(natsSubject, mustMarshal(data)); err != nil {
 				lg.Errorf("Ошибка публикации в NATS: %v", err)
 			}
-			// save JSON
 			if err := saveTradingData(data); err != nil {
 				lg.Errorf("Ошибка сохранения JSON: %v", err)
 			}
-			// save CSV history
 			if err := saveHistory(currentPair, ticks); err != nil {
 				lg.Errorf("Ошибка сохранения истории: %v", err)
 			}
@@ -204,9 +212,8 @@ func main() {
 	}
 }
 
-// ===================== Фильтрация и выбор пары =====================
+// ===================== Функции выбора пары =====================
 
-// getFilteredUSDTMarkets возвращает только пары с суффиксом USDT и оборотом ≥ minLiquidityUSD
 func getFilteredUSDTMarkets() (map[string]MarketData, error) {
 	url := fmt.Sprintf("%s/v5/market/tickers?category=spot", bybitREST)
 	var resp struct {
@@ -237,7 +244,6 @@ func getFilteredUSDTMarkets() (map[string]MarketData, error) {
 	return out, nil
 }
 
-// calcCombinedVolatility считает 70% daily + 30% hourly волатильность
 func calcCombinedVolatility(symbol string) (float64, error) {
 	// daily
 	dailyURL := fmt.Sprintf("%s/v5/market/kline?category=spot&symbol=%s&interval=D&limit=100",
@@ -290,19 +296,24 @@ func calcCombinedVolatility(symbol string) (float64, error) {
 		}
 	}
 	if len(highs) > 0 && len(lows) > 0 {
-		minLow := math.Min(lows[0], lows[0])
+		minLow := lows[0]
 		for _, v := range lows {
 			if v < minLow {
 				minLow = v
 			}
 		}
-		shortVol := (math.Max(highs[0], highs[0]) - minLow) / minLow * 100
+		maxHigh := highs[0]
+		for _, v := range highs {
+			if v > maxHigh {
+				maxHigh = v
+			}
+		}
+		shortVol := (maxHigh - minLow) / minLow * 100
 		return volatilityWeight*dailyVol + (1-volatilityWeight)*shortVol, nil
 	}
 	return dailyVol, nil
 }
 
-// selectMostVolatilePair возвращает пару с максимальным score
 func selectMostVolatilePair(data map[string]MarketData, fallback string) (string, float64) {
 	type info struct{ Sym string; Score, Vol float64 }
 	var list []info
@@ -321,10 +332,13 @@ func selectMostVolatilePair(data map[string]MarketData, fallback string) (string
 	return list[0].Sym, list[0].Vol
 }
 
-// ===================== WebSocket-стрим =====================
+// ===================== WebSocket =====================
 
 func startTradeStream(symbol string) (*websocket.Conn, error) {
-	dialer := websocket.Dialer{HandshakeTimeout: wsDialTimeout, TLSClientConfig: &tls.Config{}}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: wsDialTimeout,
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: false},
+	}
 	conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent": []string{apiUserAgent}})
 	if err != nil {
 		return nil, err
@@ -334,7 +348,6 @@ func startTradeStream(symbol string) (*websocket.Conn, error) {
 		"op":   "subscribe",
 		"args": []string{fmt.Sprintf("publicTrade.%s", symbol)},
 	})
-	// читаем и буферизуем тики
 	go func() {
 		for {
 			_, raw, err := conn.ReadMessage()
@@ -363,16 +376,35 @@ func startTradeStream(symbol string) (*websocket.Conn, error) {
 	return conn, nil
 }
 
-// ===================== Вспомогательные функции =====================
+// ===================== HTTP + подпись =====================
+
+func signRequest(req *http.Request) {
+	if cfg.APIKey == "" {
+		return
+	}
+	ts := strconv.FormatInt(time.Now().UnixNano()/1e6, 10)
+	prehash := ts + req.Method + req.URL.RequestURI()
+	mac := hmac.New(sha256.New, []byte(cfg.APISecret))
+	mac.Write([]byte(prehash))
+	sign := hex.EncodeToString(mac.Sum(nil))
+
+	req.Header.Set("X-BAPI-API-KEY", cfg.APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", apiRecvWindow)
+	req.Header.Set("X-BAPI-SIGN", sign)
+}
 
 func getJSON(url string, out interface{}) error {
 	<-rateLimit
 	defer func() { rateLimit <- struct{}{} }()
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", apiUserAgent)
+	signRequest(req)
+
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -385,13 +417,15 @@ func getJSON(url string, out interface{}) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// ===================== Сохранение данных =====================
+
 func saveTradingData(data TradingData) error {
-	file, err := os.Create(dataFilePath)
+	f, err := os.Create(dataFilePath)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	enc := json.NewEncoder(file)
+	defer f.Close()
+	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(data)
 }
@@ -420,6 +454,23 @@ func mustMarshal(v interface{}) []byte {
 	return b
 }
 
+// ===================== Логирование, баннер =====================
+
+func initLogging() {
+	lg = logrus.New()
+	lg.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		log.Fatalf("Не удалось создать logs/: %v", err)
+	}
+	var err error
+	logFile, err = os.OpenFile(filepath.Join("logs", time.Now().Format("2006-01-02")+".log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Не удалось открыть лог: %v", err)
+	}
+	lg.SetOutput(io.MultiWriter(os.Stdout, logFile))
+}
+
 func printBanner() {
 	fmt.Println(`
 ██████╗ ██████╗ ███████╗ █████╗ ██╗     ██╗██╗  ██╗
@@ -439,20 +490,4 @@ func printPairInfo(symbol string, price, vol float64) {
 	fmt.Printf("Текущая цена: %.8f\n", price)
 	fmt.Printf("Волатильность: %.2f%%\n", vol)
 	fmt.Println("========================================\n")
-}
-
-func initLogging() {
-	lg = logrus.New()
-	lg.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-	logDir := "logs"
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		log.Fatalf("Не удалось создать %s: %v", logDir, err)
-	}
-	var err error
-	logFile, err = os.OpenFile(filepath.Join(logDir, time.Now().Format("2006-01-02")+".log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatalf("Не удалось открыть файл лога: %v", err)
-	}
-	lg.SetOutput(io.MultiWriter(os.Stdout, logFile))
 }
