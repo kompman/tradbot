@@ -37,7 +37,7 @@ const (
 	minLiquidityUSD  = 10000.0           // минимум оборота для пары
 	volatilityWeight = 0.6               // вес волатильности в score
 	volumeWeight     = 0.4               // вес объёма в score
-	volatilityInt    = 10 * time.Minute  // как часто пересчитываем пару
+	volatilityInt    = 10 * time.Second  // как часто пересчитываем пару
 	saveInterval     = 5 * time.Second   // как часто публикуем/сохраняем тики
 	apiUserAgent     = "AnalitikBot/1.0"
 	wsDialTimeout    = 5 * time.Second
