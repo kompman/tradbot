@@ -43,7 +43,7 @@ const (
 	apiUserAgent    = "AnalitikBot/1.0"
 	apiRecvWindow   = "5000"
 	rateLimitPerSec = 40
-	dataFilePath    = "/home/k/kasper1711/trading_data.json"
+	dataFilePath    = "trading_data.json"
 
 	natsURL     = "nats://localhost:4222"
 	natsSubject = "trading.data"
