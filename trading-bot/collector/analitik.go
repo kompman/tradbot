@@ -512,22 +512,32 @@ func min(a, b int) int {
 }
 
 func supportsWebSocket(symbol string) bool {
-	dialer := websocket.Dialer{HandshakeTimeout: wsConnectTimeout}
-	conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent": []string{apiUserAgent}})
-	if err != nil {
-		       return false
-		   }
-		   defer conn.Close()
-		  
-		      sub := map[string]interface{}{
-		          "op":   "subscribe",
-		          "args": []string{fmt.Sprintf("publicTrade.%s", symbol)},
-		      }
-		      if err := conn.WriteJSON(sub); err != nil {
-		          return false
-		      }
-		      return true
-		   }
+    dialer := websocket.Dialer{HandshakeTimeout: wsConnectTimeout}
+    conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent":[]string{apiUserAgent}})
+    if err != nil {
+        return false
+    }
+    defer conn.Close()
+    // проверяем, что сервер принимает подписку
+    sub := map[string]interface{}{
+        "op":"subscribe",
+        "args":[]string{fmt.Sprintf("publicTrade.%s", symbol)},
+    }
+    if err := conn.WriteJSON(sub); err != nil {
+        return false
+    }
+    // ждём подтверждения подписки
+    conn.SetReadDeadline(time.Now().Add(5*time.Second))
+    var resp map[string]interface{}
+    if err := conn.ReadJSON(&resp); err != nil {
+        return false
+    }
+    // Bybit отдаёт {"success":true,...} или error
+    if ok, _ := resp["success"].(bool); !ok {
+        return false
+    }
+    return true
+}
 
 
 func runOnce(ctx context.Context, cfg Config) error {
