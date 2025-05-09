@@ -16,8 +16,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
-    "time"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go"
@@ -25,78 +26,41 @@ import (
 	"gonum.org/v1/gonum/stat"
 )
 
+// ===================== Константы =====================
 const (
-	bybitREST       = "https://api.bybit.com"
-	wsEndpoint      = "wss://stream.bybit.com/v5/public/spot"
-	tickTarget      = 500
-	volLookback     = 24 * time.Hour
-	minLiquidityUSD = 10000
-	minVolatility   = 0.8
-	maxPairsToCheck = 20
-	cooldownPeriod  = 5 * time.Minute
-
-	wsConnectTimeout = 30 * time.Second
-	wsReadTimeout    = 30 * time.Second
-	wsWriteTimeout   = 30 * time.Second
-	pingInterval     = 15 * time.Second
-
-	apiUserAgent    = "AnalitikBot/1.0"
-	apiRecvWindow   = "5000"
-	rateLimitPerSec = 40
-	dataFilePath    = "trading_data.json"
+	bybitREST        = "https://api.bybit.com"
+	wsEndpoint       = "wss://stream.bybit.com/v5/public/spot"
+	tickStoreSize    = 500      // количество тиков в буфере
+	minLiquidityUSD  = 10000    // порог оборота/ликвидности
+	volatilityWeight = 0.6      // вес волатильности в score
+	volumeWeight     = 0.4      // вес объема в score
+	volatilityInt    = 10 * time.Minute   // как часто пересчитывать пару
+	saveInterval     = 5 * time.Second    // как часто сохранять буфер тиков
+	apiUserAgent     = "AnalitikBot/1.0"
+	wsDialTimeout    = 5 * time.Second
+	wsReadTimeout    = 10 * time.Second
 
 	natsURL     = "nats://localhost:4222"
 	natsSubject = "trading.data"
+
+	dataFilePath = "trading_data.json"
 )
 
-func supportsWebSocket(symbol string) bool {
-    dialer := websocket.Dialer{HandshakeTimeout: wsConnectTimeout}
-    conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent": []string{apiUserAgent}})
-    if err != nil {
-        return false
-    }
-    defer conn.Close()
+// ===================== Типы =====================
 
-    // подписка
-    sub := map[string]interface{}{
-        "op":   "subscribe",
-        "args": []string{fmt.Sprintf("publicTrade.%s", symbol)},
-    }
-    if err := conn.WriteJSON(sub); err != nil {
-        return false
-    }
-
-    // ждём подтверждения
-    conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-    _, msg, err := conn.ReadMessage()
-    if err != nil {
-        return false
-    }
-
-    // разбираем ответ { "success": true, ... }
-    var resp struct {
-        Success bool   `json:"success"`
-        RetMsg  string `json:"ret_msg"`
-    }
-    if err := json.Unmarshal(msg, &resp); err != nil {
-        return false
-    }
-    return resp.Success
-}
-
+// Config может быть расширен чтением из YAML/ENV
 type Config struct {
-	APIKey       string `yaml:"api_key"`
-	APISecret    string `yaml:"api_secret"`
-	FallbackPair string `yaml:"fallback_pair"`
-	TestMode     bool   `yaml:"test_mode"`
+	FallbackPair string
 }
 
-type SymbolInfo struct {
-	Symbol string
-	Price  float64
-	VolPct float64
+// MarketData хранит метрики для каждой пары
+type MarketData struct {
+	Turnover float64
+	Volume   float64
+	Last     float64
 }
 
+// Tick представляет одну сделку
 type Tick struct {
 	Ts    int64   `json:"ts"`
 	Price float64 `json:"price"`
@@ -104,6 +68,7 @@ type Tick struct {
 	Side  string  `json:"side"`
 }
 
+// TradingData — упаковка для публикации в NATS
 type TradingData struct {
 	Symbol    string  `json:"symbol"`
 	Price     float64 `json:"price"`
@@ -112,44 +77,44 @@ type TradingData struct {
 	Ticks     []Tick  `json:"ticks,omitempty"`
 }
 
+// ===================== Глобальные переменные =====================
+
 var (
 	lg        *logrus.Logger
 	logFile   *os.File
-	rateLimit = make(chan struct{}, rateLimitPerSec)
-	wsCounter int
 	natsConn  *nats.Conn
+	rateLimit = make(chan struct{}, 40)
+
+	// буфер тиков + синхронизация
+	tickBuf = make([]Tick, 0, tickStoreSize)
+	bufMu   sync.Mutex
 )
+
+// ===================== Основная логика =====================
 
 func main() {
 	printBanner()
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	initLogging()
 	defer logFile.Close()
 
-	// Подключение к NATS с улучшенными параметрами
-	nc, err := nats.Connect(natsURL,
-		nats.Timeout(5*time.Second),
-		nats.MaxReconnects(5),
-		nats.ReconnectWait(2*time.Second))
+	// подключаем NATS
+	var err error
+	natsConn, err = nats.Connect(natsURL,
+		nats.MaxReconnects(5), nats.ReconnectWait(2*time.Second), nats.Timeout(5*time.Second))
 	if err != nil {
 		lg.Fatalf("Не удалось подключиться к NATS: %v", err)
 	}
-	natsConn = nc
 	defer natsConn.Close()
 	lg.Info("Успешное соединение с NATS")
 
-	if err := checkBybitConnection(); err != nil {
-		printError("Подключение к Bybit", err)
-		lg.Fatal(err)
-	}
-	lg.Info("Успешное соединение с биржей Bybit")
-
-	for i := 0; i < rateLimitPerSec; i++ {
+	// наполняем rateLimit
+	for i := 0; i < cap(rateLimit); i++ {
 		rateLimit <- struct{}{}
 	}
+
 
 	cfg := Config{
 		APIKey:       "AmbrZFvlnJQnrG84mu",
@@ -158,264 +123,266 @@ func main() {
 		TestMode:     false,
 	}
 
+	// Redis или иные сервисы можно инициализировать здесь, если нужно
+
+	var (
+		wsConn      *websocket.Conn
+		currentPair string
+	)
+
+	volTicker := time.NewTicker(volatilityInt)
+	saveTicker := time.NewTicker(saveInterval)
+	defer volTicker.Stop()
+	defer saveTicker.Stop()
+
+	lg.Infof("=== Запуск цикла каждые %s, сохранение каждые %s ===", volatilityInt, saveInterval)
+
 	for {
-		lg.Info("=== Поиск наиболее волатильной пары ===")
-		if err := runOnce(ctx, cfg); err != nil {
-			lg.Error(err)
-		}
-		printStep(fmt.Sprintf("Ожидание %v перед следующим циклом", cooldownPeriod))
 		select {
 		case <-ctx.Done():
+			lg.Info("Выход по сигналу")
+			if wsConn != nil {
+				wsConn.Close()
+			}
 			return
-		case <-time.After(cooldownPeriod):
+
+		case <-volTicker.C:
+			// 1) Фильтруем пары и выбираем лучшую
+			markets, err := getFilteredUSDTMarkets()
+			if err != nil {
+				lg.Errorf("Ошибка фильтрации пар: %v", err)
+				continue
+			}
+			pair, vol := selectMostVolatilePair(markets, cfg.FallbackPair)
+			price := markets[pair].Last
+			printPairInfo(pair, price, vol)
+
+			// 2) Переключаем WS-стрим при смене пары
+			if pair != currentPair {
+				if wsConn != nil {
+					wsConn.Close()
+				}
+				bufMu.Lock()
+				tickBuf = tickBuf[:0]
+				bufMu.Unlock()
+				wsConn, err = startTradeStream(pair)
+				if err != nil {
+					lg.Warnf("Ошибка WS для %s: %v", pair, err)
+				}
+				currentPair = pair
+			}
+
+		case <-saveTicker.C:
+			// 3) Каждые несколько секунд публикуем данные
+			bufMu.Lock()
+			ticks := make([]Tick, len(tickBuf))
+			copy(ticks, tickBuf)
+			bufMu.Unlock()
+			if len(ticks) == 0 {
+				continue
+			}
+			data := TradingData{
+				Symbol:    currentPair,
+				Price:     marketsLastPrice(currentPair),
+				VolPct:    marketsLastVol(currentPair),
+				Timestamp: time.Now().Unix(),
+				Ticks:     ticks,
+			}
+			// publish
+			if err := natsConn.Publish(natsSubject, mustMarshal(data)); err != nil {
+				lg.Errorf("Ошибка публикации в NATS: %v", err)
+			}
+			// save JSON
+			if err := saveTradingData(data); err != nil {
+				lg.Errorf("Ошибка сохранения JSON: %v", err)
+			}
+			// save CSV history
+			if err := saveHistory(currentPair, ticks); err != nil {
+				lg.Errorf("Ошибка сохранения истории: %v", err)
+			}
 		}
 	}
 }
 
-// Все остальные функции остаются БЕЗ ИЗМЕНЕНИЙ:
+// ===================== Фильтрация и выбор пары =====================
 
-func printPairInfo(symbol string, price float64, vol float64) {
-	fmt.Println("\n========================================")
-	fmt.Printf("Выбранная пара: %s\n", symbol)
-	fmt.Printf("Текущая цена: %.8f\n", price)
-	fmt.Printf("Волатильность: %.2f%%\n", vol)
-	fmt.Println("========================================\n")
-}
-
-func fetchUSDTMarketsSortedByVolume() ([]string, error) {
+// getFilteredUSDTMarkets возвращает только пары с суффиксом USDT и оборотом ≥ minLiquidityUSD
+func getFilteredUSDTMarkets() (map[string]MarketData, error) {
 	url := fmt.Sprintf("%s/v5/market/tickers?category=spot", bybitREST)
 	var resp struct {
 		RetCode int `json:"retCode"`
-		Result  struct {
-			List []struct {
-				Symbol    string `json:"symbol"`
-				Volume24h string `json:"volume24h"`
-			} `json:"list"`
-		} `json:"result"`
+		Result  struct{ List []struct {
+			Symbol     string `json:"symbol"`
+			Turnover24 string `json:"turnover24h"`
+			Volume24   string `json:"volume24h"`
+			LastPrice  string `json:"lastPrice"`
+		}} `json:"result"`
 	}
 	if err := getJSON(url, &resp); err != nil {
 		return nil, err
 	}
-
-	type pair struct {
-		symbol string
-		volume float64
-	}
-	var pairs []pair
-	for _, item := range resp.Result.List {
-		if strings.HasSuffix(item.Symbol, "USDT") {
-			vol, err := strconv.ParseFloat(item.Volume24h, 64)
-			if err != nil {
-				continue
-			}
-			pairs = append(pairs, pair{item.Symbol, vol})
+	out := make(map[string]MarketData, len(resp.Result.List))
+	for _, it := range resp.Result.List {
+		if !strings.HasSuffix(it.Symbol, "USDT") {
+			continue
 		}
+		to, _ := strconv.ParseFloat(it.Turnover24, 64)
+		if to < minLiquidityUSD {
+			continue
+		}
+		vol, _ := strconv.ParseFloat(it.Volume24, 64)
+		last, _ := strconv.ParseFloat(it.LastPrice, 64)
+		out[it.Symbol] = MarketData{Turnover: to, Volume: vol, Last: last}
 	}
-
-	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].volume > pairs[j].volume
-	})
-
-	result := make([]string, len(pairs))
-	for i, p := range pairs {
-		result[i] = p.symbol
-	}
-	return result, nil
+	return out, nil
 }
 
-func calcVolatility(symbol string) (float64, float64, error) {
-	end := time.Now().UnixMilli()
-	start := end - int64(volLookback/time.Millisecond)
-	url := fmt.Sprintf("%s/v5/market/kline?category=spot&symbol=%s&interval=60&start=%d&end=%d",
-		bybitREST, symbol, start, end)
-
-	var resp struct {
-		RetCode int `json:"retCode"`
-		Result  struct {
-			List [][]interface{} `json:"list"`
-		} `json:"result"`
-	}
-
-	if err := getJSON(url, &resp); err != nil {
-		return 0, 0, err
-	}
-
-	var prices []float64
-	for _, kline := range resp.Result.List {
-		if len(kline) < 5 {
-			continue
-		}
-		closeStr, ok := kline[4].(string)
-		if !ok {
-			continue
-		}
-		price, err := strconv.ParseFloat(closeStr, 64)
-		if err != nil {
-			continue
-		}
-		prices = append(prices, price)
-	}
-
-	if len(prices) < 2 {
-		return 0, 0, errors.New("недостаточно данных")
-	}
-
-	returns := make([]float64, len(prices)-1)
-	for i := 1; i < len(prices); i++ {
-		returns[i-1] = math.Log(prices[i] / prices[i-1])
-	}
-
-	stddev := stat.StdDev(returns, nil)
-	volatility := stddev * math.Sqrt(24) * 100
-	lastPrice := prices[len(prices)-1]
-
-	return volatility, lastPrice, nil
-}
-
-func checkLiquidity(symbol string, threshold float64) (bool, error) {
-	url := fmt.Sprintf("%s/v5/market/orderbook?category=spot&symbol=%s&limit=50",
+// calcCombinedVolatility считает 70% daily + 30% hourly волатильность
+func calcCombinedVolatility(symbol string) (float64, error) {
+	// daily
+	dailyURL := fmt.Sprintf("%s/v5/market/kline?category=spot&symbol=%s&interval=D&limit=100",
 		bybitREST, symbol)
-
-	var resp struct {
+	var rd struct {
 		RetCode int `json:"retCode"`
-		Result  struct {
-			B [][2]string `json:"b"`
-		} `json:"result"`
+		Result  struct{ List [][]interface{} } `json:"result"`
 	}
-
-	if err := getJSON(url, &resp); err != nil {
-		return false, err
+	if err := getJSON(dailyURL, &rd); err != nil {
+		return 0, err
 	}
-
-	total := 0.0
-	for _, bid := range resp.Result.B {
-		price, _ := strconv.ParseFloat(bid[0], 64)
-		size, _ := strconv.ParseFloat(bid[1], 64)
-		total += price * size
+	var closes []float64
+	for _, k := range rd.Result.List {
+		if s, ok := k[4].(string); ok {
+			if p, err := strconv.ParseFloat(s, 64); err == nil {
+				closes = append(closes, p)
+			}
+		}
 	}
+	if len(closes) < 2 {
+		return 0, errors.New("недостаточно daily данных")
+	}
+	returns := make([]float64, len(closes)-1)
+	for i := 1; i < len(closes); i++ {
+		returns[i-1] = (closes[i] - closes[i-1]) / closes[i-1]
+	}
+	dailyVol := stat.StdDev(returns, nil) * math.Sqrt(365) * 100
 
-	return total >= threshold, nil
+	// hourly
+	hourURL := fmt.Sprintf("%s/v5/market/kline?category=spot&symbol=%s&interval=60&limit=24",
+		bybitREST, symbol)
+	var rh struct {
+		RetCode int `json:"retCode"`
+		Result  struct{ List [][]interface{} } `json:"result"`
+	}
+	if err := getJSON(hourURL, &rh); err != nil {
+		return dailyVol, nil
+	}
+	var highs, lows []float64
+	for _, k := range rh.Result.List {
+		if h, ok := k[2].(string); ok {
+			if v, err := strconv.ParseFloat(h, 64); err == nil {
+				highs = append(highs, v)
+			}
+		}
+		if l, ok := k[3].(string); ok {
+			if v, err := strconv.ParseFloat(l, 64); err == nil {
+				lows = append(lows, v)
+			}
+		}
+	}
+	if len(highs) > 0 && len(lows) > 0 {
+		minLow := math.Min(lows[0], lows[0])
+		for _, v := range lows {
+			if v < minLow {
+				minLow = v
+			}
+		}
+		shortVol := (math.Max(highs[0], highs[0]) - minLow) / minLow * 100
+		return volatilityWeight*dailyVol + (1-volatilityWeight)*shortVol, nil
+	}
+	return dailyVol, nil
 }
 
-func pickMostVolatile(symbols []SymbolInfo) []SymbolInfo {
-	sorted := make([]SymbolInfo, len(symbols))
-	copy(sorted, symbols)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].VolPct > sorted[j].VolPct
-	})
-	return sorted
+// selectMostVolatilePair возвращает пару с максимальным score
+func selectMostVolatilePair(data map[string]MarketData, fallback string) (string, float64) {
+	type info struct{ Sym string; Score, Vol float64 }
+	var list []info
+	for sym, md := range data {
+		vol, err := calcCombinedVolatility(sym)
+		if err != nil || vol <= 0 {
+			continue
+		}
+		score := volatilityWeight*vol + volumeWeight*math.Min(md.Volume/1e6, 40)
+		list = append(list, info{sym, score, vol})
+	}
+	if len(list) == 0 {
+		return fallback, 0
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Score > list[j].Score })
+	return list[0].Sym, list[0].Vol
 }
 
-func collectTicksWithFallback(ctx context.Context, symbol string, limit int) ([]Tick, error) {
-	ticks, err := collectTicksWithTimeout(ctx, symbol, limit)
-	if err == nil && len(ticks) >= limit {
-		return ticks, nil
-	}
+// ===================== WebSocket-стрим =====================
 
-	lg.Warnf("WebSocket недоступен для %s, используем REST API", symbol)
-	return fetchLastTradesREST(symbol, limit-len(ticks))
-}
-
-func collectTicksWithTimeout(ctx context.Context, symbol string, limit int) ([]Tick, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout:  wsConnectTimeout,
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: false},
-	}
-
+func startTradeStream(symbol string) (*websocket.Conn, error) {
+	dialer := websocket.Dialer{HandshakeTimeout: wsDialTimeout, TLSClientConfig: &tls.Config{}}
 	conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent": []string{apiUserAgent}})
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	subMsg := map[string]interface{}{
+	// подписываемся
+	conn.WriteJSON(map[string]interface{}{
 		"op":   "subscribe",
 		"args": []string{fmt.Sprintf("publicTrade.%s", symbol)},
-	}
-
-	if err := conn.WriteJSON(subMsg); err != nil {
-		return nil, err
-	}
-
-	var ticks []Tick
-	for len(ticks) < limit {
-		select {
-		case <-ctx.Done():
-			return ticks, ctx.Err()
-		default:
-			_, msg, err := conn.ReadMessage()
+	})
+	// читаем и буферизуем тики
+	go func() {
+		for {
+			_, raw, err := conn.ReadMessage()
 			if err != nil {
-				return ticks, err
+				return
 			}
-
-			var data struct {
-				Topic string `json:"topic"`
-				Data  []struct {
-					T int64   `json:"T"`
-					P float64 `json:"p"`
-					V float64 `json:"v"`
-					S string  `json:"S"`
-				} `json:"data"`
-			}
-
-			if err := json.Unmarshal(msg, &data); err != nil {
+			var m struct{ Data []struct {
+				T int64   `json:"T"`
+				P float64 `json:"p"`
+				V float64 `json:"v"`
+				S string  `json:"S"`
+			}}
+			if err := json.Unmarshal(raw, &m); err != nil {
 				continue
 			}
-
-			for _, trade := range data.Data {
-				ticks = append(ticks, Tick{
-					Ts:    trade.T,
-					Price: trade.P,
-					Qty:   trade.V,
-					Side:  trade.S,
-				})
-
-				if len(ticks) >= limit {
-					return ticks, nil
+			bufMu.Lock()
+			for _, tr := range m.Data {
+				tickBuf = append(tickBuf, Tick{Ts: tr.T, Price: tr.P, Qty: tr.V, Side: tr.S})
+				if len(tickBuf) > tickStoreSize {
+					tickBuf = tickBuf[len(tickBuf)-tickStoreSize:]
 				}
 			}
+			bufMu.Unlock()
 		}
-	}
-	return ticks, nil
+	}()
+	return conn, nil
 }
 
-func fetchLastTradesREST(symbol string, limit int) ([]Tick, error) {
-	url := fmt.Sprintf("%s/v5/market/recent-trade?category=spot&symbol=%s&limit=%d", bybitREST, symbol, limit)
-	
-	var resp struct {
-		RetCode int `json:"retCode"`
-		Result  struct {
-			List []struct {
-				ExecPrice string `json:"execPrice"`
-				ExecQty   string `json:"execQty"`
-				ExecTime  string `json:"execTime"`
-				Side      string `json:"side"`
-			} `json:"list"`
-		} `json:"result"`
-	}
+// ===================== Вспомогательные функции =====================
 
-	if err := getJSON(url, &resp); err != nil {
-		return nil, err
+func getJSON(url string, out interface{}) error {
+	<-rateLimit
+	defer func() { rateLimit <- struct{}{} }()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
 	}
-
-	var ticks []Tick
-	for _, trade := range resp.Result.List {
-		price, _ := strconv.ParseFloat(trade.ExecPrice, 64)
-		qty, _ := strconv.ParseFloat(trade.ExecQty, 64)
-		ts, _ := strconv.ParseInt(trade.ExecTime, 10, 64)
-		
-		ticks = append(ticks, Tick{
-			Ts:    ts,
-			Price: price,
-			Qty:   qty,
-			Side:  trade.Side,
-		})
+	req.Header.Set("User-Agent", apiUserAgent)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
 	}
-
-	return ticks, nil
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func saveTradingData(data TradingData) error {
@@ -424,10 +391,9 @@ func saveTradingData(data TradingData) error {
 		return err
 	}
 	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(data)
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	return enc.Encode(data)
 }
 
 func saveHistory(symbol string, ticks []Tick) error {
@@ -435,191 +401,58 @@ func saveHistory(symbol string, ticks []Tick) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-
-	file, err := os.Create(filepath.Join(dir, time.Now().Format("2006-01-02")+".csv"))
+	f, err := os.Create(filepath.Join(dir, time.Now().Format("2006-01-02")+".csv"))
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
-	for _, tick := range ticks {
-		_, err := fmt.Fprintf(file, "%d,%.8f,%.8f,%s\n", tick.Ts, tick.Price, tick.Qty, tick.Side)
-		if err != nil {
-			return err
-		}
+	defer f.Close()
+	for _, t := range ticks {
+		fmt.Fprintf(f, "%d,%.8f,%.8f,%s\n", t.Ts, t.Price, t.Qty, t.Side)
 	}
-	return nil
-}
-
-func checkBybitConnection() error {
-	resp, err := http.Get(bybitREST + "/v5/market/instruments-info?category=spot")
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("HTTP status: %s", resp.Status)
-	}
-	return nil
-}
-
-func initLogging() {
-	lg = logrus.New()
-	lg.SetLevel(logrus.InfoLevel)
-	lg.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
-
-	logDir := "logs"
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		log.Fatalf("Не удалось создать директорию логов: %v", err)
-	}
-
-	var err error
-	logFile, err = os.OpenFile(
-		filepath.Join(logDir, time.Now().Format("2006-01-02")+".log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0644,
-	)
-	if err != nil {
-		log.Fatalf("Не удалось открыть файл лога: %v", err)
-	}
-
-	lg.SetOutput(io.MultiWriter(os.Stdout, logFile))
-}
-
-func getJSON(url string, target interface{}) error {
-	<-rateLimit
-	defer func() { rateLimit <- struct{}{} }()
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("User-Agent", apiUserAgent)
-	client := &http.Client{Timeout: 10 * time.Second}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("HTTP status: %s", resp.Status)
-	}
-
-	return json.NewDecoder(resp.Body).Decode(target)
-}
-
-func printBanner() {
-	fmt.Println(`
-███████╗███████╗██████╗ ███████╗
-██╔════╝██╔════╝██╔══██╗██╔════╝
-███████╗█████╗  ██████╔╝███████╗
-╚════██║██╔══╝  ██╔══██╗╚════██║
-███████║███████╗██║  ██║███████║
-╚══════╝╚══════╝╚═╝  ╚═╝╚══════╝
-	`)
-	fmt.Println("[Система мониторинга запущена]")
-	fmt.Println("[Версия: 1.0]")
-}
-
-func printStep(msg string) {
-	fmt.Printf("\n=== %s ===\n", msg)
-}
-
-func printSuccess(msg string) {
-	fmt.Printf("\n✓ %s\n", msg)
-}
-
-func printError(ctx string, err error) {
-	fmt.Printf("\n✗ Ошибка в %s: %v\n", ctx, err)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-
-
-
-func runOnce(ctx context.Context, cfg Config) error {
-    symbols, err := fetchUSDTMarketsSortedByVolume()
-    if err != nil {
-        return fmt.Errorf("ошибка получения списка пар: %w", err)
-    }
-
-    var validSymbols []SymbolInfo
-    for _, symbol := range symbols[:min(len(symbols), maxPairsToCheck)] {
-        // <<< ЭТОТ БЛОК ВСТАВИТЬ ПРЯМО ПЕРЕД calcVolatility
-        if !supportsWebSocket(symbol) {
-            lg.Infof("Пропускаем %s — WebSocket недоступен", symbol)
-            continue
-        }
-        // <<< КОНЕЦ ВСТАВКИ
-
-        volatility, price, err := calcVolatility(symbol)
-        if err != nil {
-            lg.Warnf("Ошибка расчета волатильности для %s: %v", symbol, err)
-            continue
-        }
-        if volatility < minVolatility {
-            continue
-        }
-        hasLiquidity, err := checkLiquidity(symbol, minLiquidityUSD)
-        if err != nil {
-            lg.Warnf("Ошибка проверки ликвидности для %s: %v", symbol, err)
-            continue
-        }
-        if hasLiquidity {
-            validSymbols = append(validSymbols, SymbolInfo{symbol, price, volatility})
-        }
-    }
-
-    if len(validSymbols) == 0 {
-        return errors.New("нет подходящих торговых пар")
-    }
-
-	selected := pickMostVolatile(validSymbols)[0]
-	printPairInfo(selected.Symbol, selected.Price, selected.VolPct)
-
-	ticks, err := collectTicksWithFallback(ctx, selected.Symbol, tickTarget)
-	if err != nil {
-		return fmt.Errorf("ошибка сбора тиков: %w", err)
-	}
-
-	data := TradingData{
-		Symbol:    selected.Symbol,
-		Price:     selected.Price,
-		VolPct:    selected.VolPct,
-		Timestamp: time.Now().Unix(),
-		Ticks:     ticks,
-	}
-
-	if err := natsConn.Publish(natsSubject, mustMarshal(data)); err != nil {
-		lg.Errorf("Ошибка публикации в NATS: %v", err)
-	}
-
-	if err := saveTradingData(data); err != nil {
-		return fmt.Errorf("ошибка сохранения данных: %w", err)
-	}
-
-	if err := saveHistory(selected.Symbol, ticks); err != nil {
-		lg.Errorf("Ошибка сохранения истории: %v", err)
-	}
-
-	printSuccess("Цикл завершен успешно")
 	return nil
 }
 
 func mustMarshal(v interface{}) []byte {
-	data, err := json.Marshal(v)
+	b, err := json.Marshal(v)
 	if err != nil {
 		panic(err)
 	}
-	return data
+	return b
+}
+
+func printBanner() {
+	fmt.Println(`
+██████╗ ██████╗ ███████╗ █████╗ ██╗     ██╗██╗  ██╗
+██╔══██╗██╔══██╗██╔════╝██╔══██╗██║     ██║██║  ██║
+██████╔╝██████╔╝█████╗  ███████║██║     ██║███████║
+██╔═══╝ ██╔══██╗██╔══╝  ██╔══██║██║     ██║██╔══██║
+██║     ██║  ██║███████╗██║  ██║███████╗██║██║  ██║
+╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝╚═╝  ╚═╝
+[Система мониторинга запущена]
+[Версия: 1.0]
+`)
+}
+
+func printPairInfo(symbol string, price, vol float64) {
+	fmt.Println("\n========================================")
+	fmt.Printf("Выбранная пара: %s\n", symbol)
+	fmt.Printf("Текущая цена: %.8f\n", price)
+	fmt.Printf("Волатильность: %.2f%%\n", vol)
+	fmt.Println("========================================\n")
+}
+
+func initLogging() {
+	lg = logrus.New()
+	lg.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+	logDir := "logs"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Fatalf("Не удалось создать %s: %v", logDir, err)
+	}
+	var err error
+	logFile, err = os.OpenFile(filepath.Join(logDir, time.Now().Format("2006-01-02")+".log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Не удалось открыть файл лога: %v", err)
+	}
+	lg.SetOutput(io.MultiWriter(os.Stdout, logFile))
 }
