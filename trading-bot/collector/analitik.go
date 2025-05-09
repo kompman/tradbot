@@ -49,6 +49,8 @@ const (
 	natsSubject = "trading.data"
 )
 
+
+
 type Config struct {
 	APIKey       string `yaml:"api_key"`
 	APISecret    string `yaml:"api_secret"`
@@ -509,6 +511,25 @@ func min(a, b int) int {
 	return b
 }
 
+func supportsWebSocket(symbol string) bool {
+	dialer := websocket.Dialer{HandshakeTimeout: wsConnectTimeout}
+	conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent": []string{apiUserAgent}})
+	if err != nil {
+		       return false
+		   }
+		   defer conn.Close()
+		  
+		      sub := map[string]interface{}{
+		          "op":   "subscribe",
+		          "args": []string{fmt.Sprintf("publicTrade.%s", symbol)},
+		      }
+		      if err := conn.WriteJSON(sub); err != nil {
+		          return false
+		      }
+		      return true
+		   }
+
+
 func runOnce(ctx context.Context, cfg Config) error {
 	symbols, err := fetchUSDTMarketsSortedByVolume()
 	if err != nil {
@@ -517,6 +538,10 @@ func runOnce(ctx context.Context, cfg Config) error {
 
 	var validSymbols []SymbolInfo
 	for _, symbol := range symbols[:min(len(symbols), maxPairsToCheck)] {
+		if !supportsWebSocket(symbol) {
+			            lg.Infof("Пропускаем %s — WebSocket недоступен", symbol)
+			            continue
+			        }
 		volatility, price, err := calcVolatility(symbol)
 		if err != nil {
 			lg.Warnf("Ошибка расчета волатильности для %s: %v", symbol, err)
