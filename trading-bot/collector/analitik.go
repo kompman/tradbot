@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
+    "time"
 
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go"
@@ -49,7 +49,24 @@ const (
 	natsSubject = "trading.data"
 )
 
+func supportsWebSocket(symbol string) bool {
+    dialer := websocket.Dialer{HandshakeTimeout: wsConnectTimeout}
+    conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent": []string{apiUserAgent}})
+    if err != nil {
+        return false
+    }
+    defer conn.Close()
 
+    // Пробуем подписаться на канал publicTrade.<symbol>
+    sub := map[string]interface{}{
+        "op":   "subscribe",
+        "args": []string{fmt.Sprintf("publicTrade.%s", symbol)},
+    }
+    if err := conn.WriteJSON(sub); err != nil {
+        return false
+    }
+    return true
+}
 
 type Config struct {
 	APIKey       string `yaml:"api_key"`
@@ -511,71 +528,45 @@ func min(a, b int) int {
 	return b
 }
 
-func supportsWebSocket(symbol string) bool {
-    dialer := websocket.Dialer{HandshakeTimeout: wsConnectTimeout}
-    conn, _, err := dialer.Dial(wsEndpoint, http.Header{"User-Agent":[]string{apiUserAgent}})
-    if err != nil {
-        return false
-    }
-    defer conn.Close()
-    // проверяем, что сервер принимает подписку
-    sub := map[string]interface{}{
-        "op":"subscribe",
-        "args":[]string{fmt.Sprintf("publicTrade.%s", symbol)},
-    }
-    if err := conn.WriteJSON(sub); err != nil {
-        return false
-    }
-    // ждём подтверждения подписки
-    conn.SetReadDeadline(time.Now().Add(5*time.Second))
-    var resp map[string]interface{}
-    if err := conn.ReadJSON(&resp); err != nil {
-        return false
-    }
-    // Bybit отдаёт {"success":true,...} или error
-    if ok, _ := resp["success"].(bool); !ok {
-        return false
-    }
-    return true
-}
+
 
 
 func runOnce(ctx context.Context, cfg Config) error {
-	symbols, err := fetchUSDTMarketsSortedByVolume()
-	if err != nil {
-		return fmt.Errorf("ошибка получения списка пар: %w", err)
-	}
+    symbols, err := fetchUSDTMarketsSortedByVolume()
+    if err != nil {
+        return fmt.Errorf("ошибка получения списка пар: %w", err)
+    }
 
-	var validSymbols []SymbolInfo
-	for _, symbol := range symbols[:min(len(symbols), maxPairsToCheck)] {
-		if !supportsWebSocket(symbol) {
-			            lg.Infof("Пропускаем %s — WebSocket недоступен", symbol)
-			            continue
-			        }
-		volatility, price, err := calcVolatility(symbol)
-		if err != nil {
-			lg.Warnf("Ошибка расчета волатильности для %s: %v", symbol, err)
-			continue
-		}
+    var validSymbols []SymbolInfo
+    for _, symbol := range symbols[:min(len(symbols), maxPairsToCheck)] {
+        // <<< ЭТОТ БЛОК ВСТАВИТЬ ПРЯМО ПЕРЕД calcVolatility
+        if !supportsWebSocket(symbol) {
+            lg.Infof("Пропускаем %s — WebSocket недоступен", symbol)
+            continue
+        }
+        // <<< КОНЕЦ ВСТАВКИ
 
-		if volatility < minVolatility {
-			continue
-		}
+        volatility, price, err := calcVolatility(symbol)
+        if err != nil {
+            lg.Warnf("Ошибка расчета волатильности для %s: %v", symbol, err)
+            continue
+        }
+        if volatility < minVolatility {
+            continue
+        }
+        hasLiquidity, err := checkLiquidity(symbol, minLiquidityUSD)
+        if err != nil {
+            lg.Warnf("Ошибка проверки ликвидности для %s: %v", symbol, err)
+            continue
+        }
+        if hasLiquidity {
+            validSymbols = append(validSymbols, SymbolInfo{symbol, price, volatility})
+        }
+    }
 
-		hasLiquidity, err := checkLiquidity(symbol, minLiquidityUSD)
-		if err != nil {
-			lg.Warnf("Ошибка проверки ликвидности для %s: %v", symbol, err)
-			continue
-		}
-
-		if hasLiquidity {
-			validSymbols = append(validSymbols, SymbolInfo{symbol, price, volatility})
-		}
-	}
-
-	if len(validSymbols) == 0 {
-		return errors.New("нет подходящих торговых пар")
-	}
+    if len(validSymbols) == 0 {
+        return errors.New("нет подходящих торговых пар")
+    }
 
 	selected := pickMostVolatile(validSymbols)[0]
 	printPairInfo(selected.Symbol, selected.Price, selected.VolPct)
